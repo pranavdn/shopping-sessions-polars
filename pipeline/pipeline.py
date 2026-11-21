@@ -1,6 +1,6 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
-Shopping Sessions: Polars starter — Complete rule-accurate implementation.
+Shopping Sessions: High-speed Polars implementation with exact rule parity.
 """
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
@@ -23,9 +23,9 @@ MS_PER_SEC = 1_000
 MS_PER_MIN = 60_000
 MS_PER_HOUR = 3_600_000
 MS_PER_DAY = 86_400_000
-SESSION_GAP_MS = 30 * MS_PER_MIN        # 1,800,000 ms (new session if > this)
-LATE_LIMIT_MS = 24 * MS_PER_HOUR        # 86,400,000 ms (drop if ingest_ts - ts > this)
-LOOKBACK_7D_MS = 7 * MS_PER_DAY         # 604,800,000 ms
+SESSION_GAP_MS = 30 * MS_PER_MIN
+LATE_LIMIT_MS = 24 * MS_PER_HOUR
+LOOKBACK_7D_MS = 7 * MS_PER_DAY
 
 ASCII_DIGITS_RE = re.compile(r"^[0-9]+$")
 F1_RE = re.compile(r"^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})Z$")
@@ -143,10 +143,6 @@ def parse_price_cents(val: str) -> int | None:
 
 
 def build_person_lookup(link_files: list[str]) -> dict[str, str]:
-    """
-    Union-Find over links/*.csv where each person is named by the byte-wise smallest
-    user_id in their connected component. Unlinked user_ids resolve to themselves.
-    """
     parent: dict[str, str] = {}
 
     def find(x: str) -> str:
@@ -182,11 +178,6 @@ def build_person_lookup(link_files: list[str]) -> dict[str, str]:
             comp_min_str[r] = uid
 
     return {uid: comp_min_str[find(uid)] for uid in parent}
-
-
-def utc_date_from_ms(ts_ms: int):
-    days = ts_ms // MS_PER_DAY
-    return (datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(days=days)).date()
 
 
 def main():
@@ -230,8 +221,7 @@ def main():
             if prev is None or ingest_ms < prev[0]:
                 kept_by_event_id[event_id] = (ingest_ms, row)
 
-    events_by_person: dict[str, list[tuple[int, str, int, bool]]] = defaultdict(list)
-
+    valid_events = []
     for _event_id, (ingest_ms, row) in kept_by_event_id.items():
         _ev_id, uid, ts_raw, _ingest_raw, etype, pid, price_raw = row
         if uid == "" or pid == "" or etype not in VALID_EVENT_TYPES:
@@ -251,14 +241,17 @@ def main():
         if (ingest_ms - ts_ms) > LATE_LIMIT_MS:
             continue
 
-        person = resolve_person(uid)
-        category = products.get(pid, "unknown")
-        events_by_person[person].append((ts_ms, category, price_cents, is_purchase))
+        valid_events.append({
+            "person": resolve_person(uid),
+            "ts_ms": ts_ms,
+            "category": products.get(pid, "unknown"),
+            "is_purchase": is_purchase,
+            "rev_cents": price_cents,
+        })
 
     # 2. Clicks: parse -> dedup on click_id -> validate
     seen_click_ids: set[str] = set()
-    clicks_by_person: dict[str, list[tuple[int, str, str]]] = defaultdict(list)
-
+    valid_clicks = []
     for cf in click_files:
         for click_id, uid, cid, ts_raw in iter_csv_rows(cf, 4):
             if click_id == "" or click_id in seen_click_ids:
@@ -271,14 +264,103 @@ def main():
             if ts_ms is None or not (click_start_ms <= ts_ms < win_end_ms):
                 continue
 
-            person = resolve_person(uid)
-            clicks_by_person[person].append((ts_ms, click_id, cid))
+            valid_clicks.append({
+                "person": resolve_person(uid),
+                "ts_ms": ts_ms,
+                "click_id": click_id,
+                "campaign_id": cid,
+            })
 
-    for p_clicks in clicks_by_person.values():
-        p_clicks.sort(key=lambda x: x[0])
+    ev_schema = {"person": pl.String, "ts_ms": pl.Int64, "category": pl.String, "is_purchase": pl.Boolean, "rev_cents": pl.Int64}
+    cl_schema = {"person": pl.String, "ts_ms": pl.Int64, "click_id": pl.String, "campaign_id": pl.String}
 
-    # 3. Sessionize per person, attribute to click, count 7-day assists, roll up daily tables
-    user_acc: dict[tuple[str, object], dict] = {}
+    ev_df = pl.DataFrame(valid_events, schema=ev_schema) if valid_events else pl.DataFrame(schema=ev_schema)
+    cl_df = pl.DataFrame(valid_clicks, schema=cl_schema) if valid_clicks else pl.DataFrame(schema=cl_schema)
+
+    # 3. Sessionize per person in Polars
+    if ev_df.height > 0:
+        ev_sorted = ev_df.sort(["person", "ts_ms"])
+        prev_ts = pl.col("ts_ms").shift(1).over("person")
+        distinct_ts = (
+            pl.when(prev_ts.is_null() | (pl.col("ts_ms") != prev_ts))
+            .then(pl.col("ts_ms"))
+            .otherwise(None)
+            .forward_fill()
+            .over("person")
+        )
+        prev_distinct = distinct_ts.shift(1).over("person")
+        new_sess_flag = (
+            prev_distinct.is_null()
+            | ((distinct_ts != prev_distinct) & ((distinct_ts - prev_distinct) > SESSION_GAP_MS))
+        ).cast(pl.Int64)
+        ev_sess = ev_sorted.with_columns(new_sess_flag.cum_sum().over("person").alias("sess_num"))
+
+        sessions_df = (
+            ev_sess.group_by(["person", "sess_num"])
+            .agg([
+                pl.col("ts_ms").min().alias("session_start_ts"),
+                pl.len().cast(pl.Int64).alias("s_events"),
+                pl.col("is_purchase").cast(pl.Int64).sum().alias("s_purchases"),
+                pl.col("rev_cents").sum().alias("s_revenue"),
+            ])
+            .with_columns([
+                (pl.col("session_start_ts") // MS_PER_DAY)
+                .cast(pl.Int32)
+                .cast(pl.Date)
+                .alias("session_day"),
+            ])
+        )
+
+        cat_rev_df = (
+            ev_sess.join(sessions_df.select(["person", "sess_num", "session_day"]), on=["person", "sess_num"], how="inner")
+            .filter(pl.col("is_purchase") & (pl.col("rev_cents") > 0))
+            .group_by(["person", "session_day", "category"])
+            .agg(pl.col("rev_cents").sum().alias("cat_rev"))
+        )
+        if cat_rev_df.height > 0:
+            top_cat_map: dict[tuple[str, object], str] = {}
+            best_score: dict[tuple[str, object], tuple[int, bytes]] = {}
+            for row in cat_rev_df.iter_rows(named=True):
+                key = (row["person"], row["session_day"])
+                score = (-int(row["cat_rev"]), row["category"].encode("utf-8"))
+                if key not in best_score or score < best_score[key]:
+                    best_score[key] = score
+                    top_cat_map[key] = row["category"]
+            top_cat_df = pl.DataFrame(
+                [{"person": k[0], "session_day": k[1], "top_category": v} for k, v in top_cat_map.items()],
+                schema={"person": pl.String, "session_day": pl.Date, "top_category": pl.String},
+            )
+        else:
+            top_cat_df = pl.DataFrame(schema={"person": pl.String, "session_day": pl.Date, "top_category": pl.String})
+
+        user_df = (
+            sessions_df.group_by(["person", "session_day"])
+            .agg([
+                pl.len().cast(pl.Int64).alias("sessions"),
+                pl.col("s_events").sum().alias("events"),
+                pl.col("s_revenue").sum().alias("revenue_cents"),
+            ])
+            .join(top_cat_df, on=["person", "session_day"], how="left")
+            .with_columns([
+                pl.when(pl.col("revenue_cents") > 0).then(pl.col("top_category")).otherwise(None).alias("top_category"),
+            ])
+            .select([
+                pl.col("person").alias("user_id"),
+                pl.col("session_day").alias("day"),
+                "sessions",
+                "events",
+                "revenue_cents",
+                "top_category",
+            ])
+            .cast(USER_DAILY)
+        )
+    else:
+        sessions_df = pl.DataFrame(
+            schema={"person": pl.String, "sess_num": pl.Int64, "session_start_ts": pl.Int64, "s_events": pl.Int64, "s_purchases": pl.Int64, "s_revenue": pl.Int64, "session_day": pl.Date}
+        )
+        user_df = pl.DataFrame(schema=USER_DAILY)
+
+    # 4. Attribution & 7-day assists per session
     camp_acc: dict[tuple[str, object], dict] = {}
 
     def get_camp(cid: str, day):
@@ -298,58 +380,21 @@ def main():
             camp_acc[key] = entry
         return entry
 
-    for person, p_events in events_by_person.items():
-        p_events.sort(key=lambda x: x[0])
-        p_clicks = clicks_by_person.get(person, [])
+    if sessions_df.height > 0:
+        clicks_by_p: dict[str, list[tuple[int, str, str]]] = defaultdict(list)
+        for row in cl_df.iter_rows(named=True):
+            clicks_by_p[row["person"]].append((int(row["ts_ms"]), row["click_id"], row["campaign_id"]))
 
-        n = len(p_events)
-        idx = 0
-        while idx < n:
-            session_start_ts = p_events[idx][0]
-            session_day = utc_date_from_ms(session_start_ts)
-            prev_distinct_ts = session_start_ts
+        for s_row in sessions_df.iter_rows(named=True):
+            person = s_row["person"]
+            s_start = int(s_row["session_start_ts"])
+            s_day = s_row["session_day"]
+            s_purch = int(s_row["s_purchases"])
+            s_rev = int(s_row["s_revenue"])
 
-            s_events = 0
-            s_purchases = 0
-            s_revenue = 0
-            s_cat_rev: dict[str, int] = defaultdict(int)
-
-            while idx < n:
-                ev_ts, ev_cat, ev_price, ev_is_purch = p_events[idx]
-                if ev_ts != prev_distinct_ts:
-                    if (ev_ts - prev_distinct_ts) > SESSION_GAP_MS:
-                        break
-                    prev_distinct_ts = ev_ts
-
-                s_events += 1
-                if ev_is_purch:
-                    s_purchases += 1
-                    s_revenue += ev_price
-                    s_cat_rev[ev_cat] += ev_price
-                idx += 1
-
-            ukey = (person, session_day)
-            u_entry = user_acc.get(ukey)
-            if u_entry is None:
-                u_entry = {
-                    "user_id": person,
-                    "day": session_day,
-                    "sessions": 0,
-                    "events": 0,
-                    "revenue_cents": 0,
-                    "cat_rev": defaultdict(int),
-                }
-                user_acc[ukey] = u_entry
-            u_entry["sessions"] += 1
-            u_entry["events"] += s_events
-            u_entry["revenue_cents"] += s_revenue
-            for c_name, c_amt in s_cat_rev.items():
-                u_entry["cat_rev"][c_name] += c_amt
-
-            min_ts = session_start_ts - LOOKBACK_7D_MS
-            qualifying = [
-                c for c in p_clicks if min_ts <= c[0] <= session_start_ts
-            ]
+            min_ts = s_start - LOOKBACK_7D_MS
+            p_clicks = clicks_by_p.get(person, [])
+            qualifying = [c for c in p_clicks if min_ts <= c[0] <= s_start]
 
             if qualifying:
                 latest_ts = max(c[0] for c in qualifying)
@@ -363,33 +408,19 @@ def main():
                 credited_cid = "organic"
                 assisting_cids = set()
 
-            c_entry = get_camp(credited_cid, session_day)
+            c_entry = get_camp(credited_cid, s_day)
             c_entry["sessions"] += 1
-            if s_purchases > 0:
+            if s_purch > 0:
                 c_entry["purchasing_sessions"] += 1
-            c_entry["revenue_cents"] += s_revenue
+            c_entry["revenue_cents"] += s_rev
 
             for a_cid in assisting_cids:
-                get_camp(a_cid, session_day)["assisted_sessions"] += 1
+                get_camp(a_cid, s_day)["assisted_sessions"] += 1
 
-    user_rows = []
-    for u in user_acc.values():
-        rev = u["revenue_cents"]
-        if rev > 0 and u["cat_rev"]:
-            top_cat = min(
-                u["cat_rev"].items(),
-                key=lambda kv: (-kv[1], kv[0].encode("utf-8")),
-            )[0]
-        else:
-            top_cat = None
-        user_rows.append({
-            "user_id": u["user_id"],
-            "day": u["day"],
-            "sessions": u["sessions"],
-            "events": u["events"],
-            "revenue_cents": rev,
-            "top_category": top_cat,
-        })
+    user_folder = os.path.join(OUT, "user_daily")
+    camp_folder = os.path.join(OUT, "campaign_daily")
+    os.makedirs(user_folder, exist_ok=True)
+    os.makedirs(camp_folder, exist_ok=True)
 
     camp_rows = [
         {
@@ -403,13 +434,6 @@ def main():
         }
         for c in camp_acc.values()
     ]
-
-    user_folder = os.path.join(OUT, "user_daily")
-    camp_folder = os.path.join(OUT, "campaign_daily")
-    os.makedirs(user_folder, exist_ok=True)
-    os.makedirs(camp_folder, exist_ok=True)
-
-    user_df = pl.DataFrame(user_rows, schema=USER_DAILY) if user_rows else pl.DataFrame(schema=USER_DAILY)
     camp_df = pl.DataFrame(camp_rows, schema=CAMPAIGN_DAILY) if camp_rows else pl.DataFrame(schema=CAMPAIGN_DAILY)
 
     user_df.write_parquet(os.path.join(user_folder, "part-0.parquet"))
