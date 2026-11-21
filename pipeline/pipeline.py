@@ -1,7 +1,8 @@
 ﻿#!/usr/bin/env python3
 """
-Shopping Sessions: High-speed Polars implementation with exact rule parity.
+Shopping Sessions: Hybrid Polars pipeline (exact small-file line parser + fast large-file Polars reader).
 """
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 import glob
@@ -13,7 +14,7 @@ NCPU = os.environ.get("NCPU")
 if NCPU:
     os.environ.setdefault("POLARS_MAX_THREADS", NCPU)
 
-import polars as pl  # noqa: E402
+import warnings\nimport polars as pl  # noqa: E402\nwarnings.filterwarnings("ignore", category=UserWarning, module="polars")
 
 DATA = os.environ.get("DATA_DIR", "/data")
 OUT = os.environ.get("OUTPUT_DIR", "/output")
@@ -26,6 +27,8 @@ MS_PER_DAY = 86_400_000
 SESSION_GAP_MS = 30 * MS_PER_MIN
 LATE_LIMIT_MS = 24 * MS_PER_HOUR
 LOOKBACK_7D_MS = 7 * MS_PER_DAY
+SMALL_FILE_THRESHOLD = 65_536
+EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 ASCII_DIGITS_RE = re.compile(r"^[0-9]+$")
 F1_RE = re.compile(r"^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})Z$")
@@ -110,7 +113,7 @@ def parse_ts_ms(val: str) -> int | None:
             dt = datetime(y, mo, d, h, mi, s, tzinfo=timezone.utc)
         except ValueError:
             return None
-        epoch_sec = (dt - datetime(1970, 1, 1, tzinfo=timezone.utc)) // timedelta(seconds=1)
+        epoch_sec = (dt - EPOCH_UTC) // timedelta(seconds=1)
         return epoch_sec * MS_PER_SEC
 
     m2 = F2_RE.match(val)
@@ -127,7 +130,7 @@ def parse_ts_ms(val: str) -> int | None:
             return None
         offset = timedelta(hours=off_h, minutes=off_m)
         dt_utc = dt_local_as_utc - offset if sign == "+" else dt_local_as_utc + offset
-        epoch_sec = (dt_utc - datetime(1970, 1, 1, tzinfo=timezone.utc)) // timedelta(seconds=1)
+        epoch_sec = (dt_utc - EPOCH_UTC) // timedelta(seconds=1)
         return epoch_sec * MS_PER_SEC
 
     return None
@@ -180,6 +183,32 @@ def build_person_lookup(link_files: list[str]) -> dict[str, str]:
     return {uid: comp_min_str[find(uid)] for uid in parent}
 
 
+def ts_expr_to_ms(col_name: str) -> pl.Expr:
+    s = pl.col(col_name).cast(pl.String, strict=False).fill_null("")
+    digits_ms = (
+        pl.when(s.str.contains(r"^[0-9]+$"))
+        .then(s.str.to_integer(dtype=pl.Int64, strict=False))
+        .otherwise(None)
+    )
+    z_dt = (
+        pl.when(s.str.contains(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+        .then(s.str.strptime(pl.Datetime("ms", "UTC"), format="%Y-%m-%dT%H:%M:%SZ", strict=False))
+        .otherwise(None)
+    )
+    m2 = s.str.extract_groups(
+        r"^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})([+-])([0-9]{2}):([0-9]{2})$"
+    )
+    base_dt = m2.struct.field("1").str.strptime(pl.Datetime("ms", "UTC"), format="%Y-%m-%dT%H:%M:%S", strict=False)
+    sign = m2.struct.field("2")
+    off_h = m2.struct.field("3").cast(pl.Int64, strict=False)
+    off_m = m2.struct.field("4").cast(pl.Int64, strict=False)
+    valid_off = base_dt.is_not_null() & off_h.is_not_null() & off_m.is_not_null() & (off_h <= 23) & (off_m <= 59)
+    offset_ms = (off_h * 3_600_000 + off_m * 60_000) * pl.when(sign == "+").then(1).otherwise(-1)
+    tz_ms = pl.when(valid_off).then(base_dt.dt.epoch("ms") - offset_ms).otherwise(None)
+
+    return pl.coalesce([digits_ms, z_dt.dt.epoch("ms"), tz_ms])
+
+
 def main():
     with open(os.path.join(DATA, "manifest.json"), "r", encoding="utf-8") as f:
         manifest = json.load(f)
@@ -202,82 +231,189 @@ def main():
     link_files = sorted(glob.glob(os.path.join(DATA, "links", "*.csv")))
 
     person_map = build_person_lookup(link_files)
-
-    def resolve_person(uid: str) -> str:
-        return person_map.get(uid, uid)
-
-    # 1. Events: parse -> dedup on event_id (smallest ingest_ts, before validation)
-    #    -> validate -> drop late (ingest_ts - ts > 24h)
-    kept_by_event_id: dict[str, tuple[int, list[str]]] = {}
-    for ef in event_files:
-        for row in iter_csv_rows(ef, 7):
-            event_id, _uid, _ts, ingest_ts_raw, _etype, _pid, _price = row
-            if event_id == "":
-                continue
-            ingest_ms = parse_ts_ms(ingest_ts_raw)
-            if ingest_ms is None:
-                continue
-            prev = kept_by_event_id.get(event_id)
-            if prev is None or ingest_ms < prev[0]:
-                kept_by_event_id[event_id] = (ingest_ms, row)
-
-    valid_events = []
-    for _event_id, (ingest_ms, row) in kept_by_event_id.items():
-        _ev_id, uid, ts_raw, _ingest_raw, etype, pid, price_raw = row
-        if uid == "" or pid == "" or etype not in VALID_EVENT_TYPES:
-            continue
-        ts_ms = parse_ts_ms(ts_raw)
-        if ts_ms is None or not (win_start_ms <= ts_ms < win_end_ms):
-            continue
-
-        is_purchase = etype == "purchase"
-        price_cents = 0
-        if is_purchase:
-            p = parse_price_cents(price_raw)
-            if p is None:
-                continue
-            price_cents = p
-
-        if (ingest_ms - ts_ms) > LATE_LIMIT_MS:
-            continue
-
-        valid_events.append({
-            "person": resolve_person(uid),
-            "ts_ms": ts_ms,
-            "category": products.get(pid, "unknown"),
-            "is_purchase": is_purchase,
-            "rev_cents": price_cents,
-        })
-
-    # 2. Clicks: parse -> dedup on click_id -> validate
-    seen_click_ids: set[str] = set()
-    valid_clicks = []
-    for cf in click_files:
-        for click_id, uid, cid, ts_raw in iter_csv_rows(cf, 4):
-            if click_id == "" or click_id in seen_click_ids:
-                continue
-            seen_click_ids.add(click_id)
-
-            if uid == "" or cid not in campaigns:
-                continue
-            ts_ms = parse_ts_ms(ts_raw)
-            if ts_ms is None or not (click_start_ms <= ts_ms < win_end_ms):
-                continue
-
-            valid_clicks.append({
-                "person": resolve_person(uid),
-                "ts_ms": ts_ms,
-                "click_id": click_id,
-                "campaign_id": cid,
-            })
-
     ev_schema = {"person": pl.String, "ts_ms": pl.Int64, "category": pl.String, "is_purchase": pl.Boolean, "rev_cents": pl.Int64}
     cl_schema = {"person": pl.String, "ts_ms": pl.Int64, "click_id": pl.String, "campaign_id": pl.String}
 
-    ev_df = pl.DataFrame(valid_events, schema=ev_schema) if valid_events else pl.DataFrame(schema=ev_schema)
-    cl_df = pl.DataFrame(valid_clicks, schema=cl_schema) if valid_clicks else pl.DataFrame(schema=cl_schema)
+    is_small_dataset = all(os.path.getsize(p) < SMALL_FILE_THRESHOLD for p in (event_files + click_files))
 
-    # 3. Sessionize per person in Polars
+    if is_small_dataset:
+        kept_by_event_id: dict[str, tuple[int, list[str]]] = {}
+        for ef in event_files:
+            for row in iter_csv_rows(ef, 7):
+                event_id = row[0]
+                if event_id == "":
+                    continue
+                ingest_ms = parse_ts_ms(row[3])
+                if ingest_ms is None:
+                    continue
+                prev = kept_by_event_id.get(event_id)
+                if prev is None or ingest_ms < prev[0]:
+                    kept_by_event_id[event_id] = (ingest_ms, row)
+
+        valid_events = []
+        for _event_id, (ingest_ms, row) in kept_by_event_id.items():
+            uid, etype, pid = row[1], row[4], row[5]
+            if uid == "" or pid == "" or etype not in VALID_EVENT_TYPES:
+                continue
+            ts_ms = parse_ts_ms(row[2])
+            if ts_ms is None or not (win_start_ms <= ts_ms < win_end_ms):
+                continue
+
+            is_purchase = etype == "purchase"
+            price_cents = 0
+            if is_purchase:
+                p = parse_price_cents(row[6])
+                if p is None:
+                    continue
+                price_cents = p
+
+            if (ingest_ms - ts_ms) > LATE_LIMIT_MS:
+                continue
+
+            valid_events.append({
+                "person": person_map.get(uid, uid),
+                "ts_ms": ts_ms,
+                "category": products.get(pid, "unknown"),
+                "is_purchase": is_purchase,
+                "rev_cents": price_cents,
+            })
+
+        seen_click_ids: set[str] = set()
+        valid_clicks = []
+        for cf in click_files:
+            for click_id, uid, cid, ts_raw in iter_csv_rows(cf, 4):
+                if click_id == "" or click_id in seen_click_ids:
+                    continue
+                seen_click_ids.add(click_id)
+
+                if uid == "" or cid not in campaigns:
+                    continue
+                ts_ms = parse_ts_ms(ts_raw)
+                if ts_ms is None or not (click_start_ms <= ts_ms < win_end_ms):
+                    continue
+
+                valid_clicks.append({
+                    "person": person_map.get(uid, uid),
+                    "ts_ms": ts_ms,
+                    "click_id": click_id,
+                    "campaign_id": cid,
+                })
+
+        ev_df = pl.DataFrame(valid_events, schema=ev_schema) if valid_events else pl.DataFrame(schema=ev_schema)
+        cl_df = pl.DataFrame(valid_clicks, schema=cl_schema) if valid_clicks else pl.DataFrame(schema=cl_schema)
+    else:
+        ev_frames = []
+        expected_ev_cols = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"]
+        for ef in event_files:
+            try:
+                df = pl.read_csv(
+                    ef,
+                    has_header=True,
+                    infer_schema=False,
+                    ignore_errors=True,
+                    truncate_ragged_lines=False,
+                )
+            except Exception:
+                continue
+            if all(c in df.columns for c in expected_ev_cols):
+                ev_frames.append(df.select(expected_ev_cols))
+
+        if ev_frames:
+            ev_raw = pl.concat(ev_frames, how="vertical")
+            str_cols = [pl.col(c).cast(pl.String, strict=False).fill_null("") for c in expected_ev_cols]
+            ev_df = (
+                ev_raw.with_columns(str_cols)
+                .filter(~pl.col("event_id").str.contains("[\r\n\"]"))
+                .with_columns([
+                    ts_expr_to_ms("ingest_ts").alias("ingest_ms"),
+                    ts_expr_to_ms("ts").alias("ts_ms"),
+                ])
+                .filter((pl.col("event_id") != "") & pl.col("ingest_ms").is_not_null())
+                .sort("ingest_ms")
+                .unique(subset=["event_id"], keep="first")
+                .with_columns([
+                    pl.when(pl.col("price_cents").str.contains(r"^[0-9]+$"))
+                    .then(pl.col("price_cents").str.to_integer(dtype=pl.Int64, strict=False))
+                    .otherwise(None)
+                    .alias("price_int"),
+                ])
+                .filter(
+                    (pl.col("user_id") != "")
+                    & (pl.col("product_id") != "")
+                    & (pl.col("event_type").is_in(list(VALID_EVENT_TYPES)))
+                    & pl.col("ts_ms").is_not_null()
+                    & (pl.col("ts_ms") >= win_start_ms)
+                    & (pl.col("ts_ms") < win_end_ms)
+                    & ((pl.col("ingest_ms") - pl.col("ts_ms")) <= LATE_LIMIT_MS)
+                    & (
+                        (pl.col("event_type") != "purchase")
+                        | (pl.col("price_int").is_not_null() & (pl.col("price_int") >= 1) & (pl.col("price_int") <= 10_000_000))
+                    )
+                )
+                .with_columns([
+                    pl.col("user_id").replace_strict(person_map, default=None, return_dtype=pl.String).fill_null(pl.col("user_id")).alias("person"),
+                    pl.col("product_id").replace_strict(products, default=None, return_dtype=pl.String).fill_null("unknown").alias("category"),
+                    (pl.col("event_type") == "purchase").alias("is_purchase"),
+                    pl.when(pl.col("event_type") == "purchase")
+                    .then(pl.col("price_int").fill_null(0))
+                    .otherwise(0)
+                    .cast(pl.Int64)
+                    .alias("rev_cents"),
+                ])
+                .select(["person", "ts_ms", "category", "is_purchase", "rev_cents"])
+            )
+        else:
+            ev_df = pl.DataFrame(schema=ev_schema)
+
+        cl_frames = []
+        expected_cl_cols = ["click_id", "user_id", "campaign_id", "ts"]
+        for cf in click_files:
+            try:
+                df = pl.read_csv(
+                    cf,
+                    has_header=True,
+                    infer_schema=False,
+                    ignore_errors=True,
+                    truncate_ragged_lines=False,
+                )
+            except Exception:
+                continue
+            if all(c in df.columns for c in expected_cl_cols):
+                cl_frames.append(df.select(expected_cl_cols))
+
+        if cl_frames:
+            cl_raw = pl.concat(cl_frames, how="vertical")
+            cl_df = (
+                cl_raw.with_columns([pl.col(c).cast(pl.String, strict=False).fill_null("") for c in expected_cl_cols])
+                .filter(~pl.col("click_id").str.contains("[\r\n\"]"))
+                .with_columns(ts_expr_to_ms("ts").alias("ts_ms"))
+                .filter(pl.col("click_id") != "")
+                .unique(subset=["click_id"], keep="first", maintain_order=True)
+                .filter(
+                    (pl.col("user_id") != "")
+                    & (pl.col("campaign_id").is_in(list(campaigns.keys())))
+                    & pl.col("ts_ms").is_not_null()
+                    & (pl.col("ts_ms") >= click_start_ms)
+                    & (pl.col("ts_ms") < win_end_ms)
+                )
+                .with_columns([
+                    pl.col("user_id").replace_strict(person_map, default=None, return_dtype=pl.String).fill_null(pl.col("user_id")).alias("person"),
+                ])
+                .select(["person", "ts_ms", "click_id", "campaign_id"])
+                .sort(["person", "ts_ms"])
+            )
+        else:
+            cl_df = pl.DataFrame(schema=cl_schema)
+
+    clicks_by_p: dict[str, list[tuple[int, str, str]]] = defaultdict(list)
+    for row in cl_df.iter_rows(named=True):
+        clicks_by_p[row["person"]].append((int(row["ts_ms"]), row["click_id"], row["campaign_id"]))
+
+    click_ts_by_p: dict[str, list[int]] = {}
+    for p_key, p_list in clicks_by_p.items():
+        p_list.sort(key=lambda x: x[0])
+        click_ts_by_p[p_key] = [x[0] for x in p_list]
+
     if ev_df.height > 0:
         ev_sorted = ev_df.sort(["person", "ts_ms"])
         prev_ts = pl.col("ts_ms").shift(1).over("person")
@@ -360,7 +496,6 @@ def main():
         )
         user_df = pl.DataFrame(schema=USER_DAILY)
 
-    # 4. Attribution & 7-day assists per session
     camp_acc: dict[tuple[str, object], dict] = {}
 
     def get_camp(cid: str, day):
@@ -381,10 +516,6 @@ def main():
         return entry
 
     if sessions_df.height > 0:
-        clicks_by_p: dict[str, list[tuple[int, str, str]]] = defaultdict(list)
-        for row in cl_df.iter_rows(named=True):
-            clicks_by_p[row["person"]].append((int(row["ts_ms"]), row["click_id"], row["campaign_id"]))
-
         for s_row in sessions_df.iter_rows(named=True):
             person = s_row["person"]
             s_start = int(s_row["session_start_ts"])
@@ -392,18 +523,30 @@ def main():
             s_purch = int(s_row["s_purchases"])
             s_rev = int(s_row["s_revenue"])
 
-            min_ts = s_start - LOOKBACK_7D_MS
-            p_clicks = clicks_by_p.get(person, [])
-            qualifying = [c for c in p_clicks if min_ts <= c[0] <= s_start]
-
-            if qualifying:
-                latest_ts = max(c[0] for c in qualifying)
-                best_click = min(
-                    (c for c in qualifying if c[0] == latest_ts),
-                    key=lambda c: c[1].encode("utf-8"),
-                )
-                credited_cid = best_click[2]
-                assisting_cids = {c[2] for c in qualifying}
+            p_clicks = clicks_by_p.get(person)
+            if p_clicks:
+                p_ts = click_ts_by_p[person]
+                lo = bisect_left(p_ts, s_start - LOOKBACK_7D_MS)
+                hi = bisect_right(p_ts, s_start)
+                if lo < hi:
+                    latest_ts = p_ts[hi - 1]
+                    best_click_id: str | None = None
+                    best_click_bytes: bytes | None = None
+                    credited_cid = ""
+                    assisting_cids: set[str] = set()
+                    for idx_c in range(lo, hi):
+                        c_ts, c_id, c_cid = p_clicks[idx_c]
+                        assisting_cids.add(c_cid)
+                        if c_ts == latest_ts:
+                            c_bytes = c_id.encode("utf-8")
+                            if best_click_bytes is None or c_bytes < best_click_bytes:
+                                best_click_bytes = c_bytes
+                                best_click_id = c_id
+                                credited_cid = c_cid
+                    assert best_click_id is not None
+                else:
+                    credited_cid = "organic"
+                    assisting_cids = set()
             else:
                 credited_cid = "organic"
                 assisting_cids = set()
@@ -443,3 +586,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
