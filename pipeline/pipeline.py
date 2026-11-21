@@ -117,20 +117,20 @@ def sanitize_csv_file(path: str, expected_cols: int, output_path: str) -> str | 
         for line in source:
             if line.endswith(b"\n"):
                 line = line[:-1]
-            fields = line.split(b",")
-            if len(fields) != expected_cols:
+            if line.count(b",") != expected_cols - 1:
                 continue
-            valid = True
-            for field in fields:
-                if len(field) >= 2 and field.startswith(b'"') and field.endswith(b'"'):
-                    if b'"' in field[1:-1]:
-                        valid = False
-                        break
-                elif b'"' in field:
-                    valid = False
-                    break
-            if valid:
-                target.write(line + b",0\n")
+
+            # A valid quoted field has exactly one opening quote (at the
+            # start of a field) and one closing quote (at its end). Comparing
+            # byte counts avoids allocating a split list for every CSV row.
+            quote_count = line.count(b'"')
+            if quote_count:
+                openings = line.count(b',"') + line.startswith(b'"')
+                closings = line.count(b'",') + line.endswith(b'"')
+                if openings != closings or quote_count != openings + closings:
+                    continue
+
+            target.write(line + b",0\\n")
     return output_path
 
 
