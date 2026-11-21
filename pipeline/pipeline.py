@@ -14,9 +14,7 @@ NCPU = os.environ.get("NCPU")
 if NCPU:
     os.environ.setdefault("POLARS_MAX_THREADS", NCPU)
 
-import warnings
 import polars as pl  # noqa: E402
-warnings.filterwarnings("ignore", category=UserWarning, module="polars")
 
 DATA = os.environ.get("DATA_DIR", "/data")
 OUT = os.environ.get("OUTPUT_DIR", "/output")
@@ -29,7 +27,6 @@ MS_PER_DAY = 86_400_000
 SESSION_GAP_MS = 30 * MS_PER_MIN
 LATE_LIMIT_MS = 24 * MS_PER_HOUR
 LOOKBACK_7D_MS = 7 * MS_PER_DAY
-SMALL_FILE_THRESHOLD = 65_536
 EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 ASCII_DIGITS_RE = re.compile(r"^[0-9]+$")
@@ -79,22 +76,25 @@ def parse_csv_line(line: str, expected_cols: int) -> list[str] | None:
 
 
 def iter_csv_rows(path: str, expected_cols: int):
+    """Read LF-delimited CSV records one at a time, preserving CR as field data.
+
+    The input contract drops malformed physical lines independently. Polars'
+    parallel CSV reader can lose valid rows after malformed quoting in a chunk,
+    so use the exact line parser for every shard.
+    """
     if not os.path.exists(path):
         return
     with open(path, "r", encoding="utf-8", newline="") as f:
-        text = f.read()
-    if not text:
-        return
-    lines = text.split("\n")
-    if lines and lines[-1] == "":
-        lines.pop()
-    if len(lines) <= 1:
-        return
-    for line in lines[1:]:
-        parsed = parse_csv_line(line, expected_cols)
-        if parsed is not None:
-            yield parsed
-
+        header = f.readline()
+        if header == "":
+            return
+        for line in f:
+            # Remove LF only. A preceding CR is ordinary field content by spec.
+            if line.endswith("\n"):
+                line = line[:-1]
+            parsed = parse_csv_line(line, expected_cols)
+            if parsed is not None:
+                yield parsed
 
 def parse_ts_ms(val: str) -> int | None:
     if not val:
@@ -236,9 +236,11 @@ def main():
     ev_schema = {"person": pl.String, "ts_ms": pl.Int64, "category": pl.String, "is_purchase": pl.Boolean, "rev_cents": pl.Int64}
     cl_schema = {"person": pl.String, "ts_ms": pl.Int64, "click_id": pl.String, "campaign_id": pl.String}
 
-    is_small_dataset = all(os.path.getsize(p) < SMALL_FILE_THRESHOLD for p in (event_files + click_files))
+    # Always use the exact line parser. The chunked Polars CSV path silently
+    # loses valid dev rows when malformed quoting desynchronizes a read chunk.
+    use_exact_line_parser = True
 
-    if is_small_dataset:
+    if use_exact_line_parser:
         kept_by_event_id: dict[str, tuple[int, list[str]]] = {}
         for ef in event_files:
             for row in iter_csv_rows(ef, 7):
