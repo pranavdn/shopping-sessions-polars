@@ -362,14 +362,14 @@ def main():
             )
             if clean_path is None:
                 continue
-            df = pl.read_csv(
+            df = pl.scan_csv(
                 clean_path,
                 has_header=True,
                 infer_schema=False,
                 ignore_errors=False,
                 truncate_ragged_lines=False,
             )
-            if all(c in df.columns for c in expected_ev_cols):
+            if all(c in df.collect_schema().names() for c in expected_ev_cols):
                 ev_frames.append(df.select(expected_ev_cols))
 
         if ev_frames:
@@ -414,6 +414,7 @@ def main():
                     .alias("rev_cents"),
                 ])
                 .select(["person", "ts_ms", "category", "is_purchase", "rev_cents"])
+                .collect()
             )
         else:
             ev_df = pl.DataFrame(schema=ev_schema)
@@ -426,14 +427,14 @@ def main():
             )
             if clean_path is None:
                 continue
-            df = pl.read_csv(
+            df = pl.scan_csv(
                 clean_path,
                 has_header=True,
                 infer_schema=False,
                 ignore_errors=False,
                 truncate_ragged_lines=False,
             )
-            if all(c in df.columns for c in expected_cl_cols):
+            if all(c in df.collect_schema().names() for c in expected_cl_cols):
                 cl_frames.append(df.select(expected_cl_cols))
 
         if cl_frames:
@@ -455,6 +456,7 @@ def main():
                 ])
                 .select(["person", "ts_ms", "click_id", "campaign_id"])
                 .sort(["person", "ts_ms"])
+                .collect()
             )
         else:
             cl_df = pl.DataFrame(schema=cl_schema)
