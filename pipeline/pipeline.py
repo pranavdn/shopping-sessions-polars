@@ -14,7 +14,9 @@ NCPU = os.environ.get("NCPU")
 if NCPU:
     os.environ.setdefault("POLARS_MAX_THREADS", NCPU)
 
-import warnings\nimport polars as pl  # noqa: E402\nwarnings.filterwarnings("ignore", category=UserWarning, module="polars")
+import warnings
+import polars as pl  # noqa: E402
+warnings.filterwarnings("ignore", category=UserWarning, module="polars")
 
 DATA = os.environ.get("DATA_DIR", "/data")
 OUT = os.environ.get("OUTPUT_DIR", "/output")
@@ -586,4 +588,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
