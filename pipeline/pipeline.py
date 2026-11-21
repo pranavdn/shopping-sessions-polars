@@ -239,8 +239,14 @@ def ts_expr_to_ms(col_name: str) -> pl.Expr:
         .then(s.str.to_integer(dtype=pl.Int64, strict=False))
         .otherwise(None)
     )
+    # Polars/chrono can accept leap-second values such as :60. The input
+    # contract only permits ordinary clock values (00-23:00-59:00-59), so
+    # validate the clock fields before asking Polars to parse the date.
+    valid_z_clock = s.str.contains(
+        r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]Z$"
+    )
     z_dt = (
-        pl.when(s.str.contains(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+        pl.when(valid_z_clock)
         .then(s.str.strptime(pl.Datetime("ms", "UTC"), format="%Y-%m-%dT%H:%M:%SZ", strict=False))
         .otherwise(None)
     )
@@ -251,7 +257,17 @@ def ts_expr_to_ms(col_name: str) -> pl.Expr:
     sign = m2.struct.field("2")
     off_h = m2.struct.field("3").cast(pl.Int64, strict=False)
     off_m = m2.struct.field("4").cast(pl.Int64, strict=False)
-    valid_off = base_dt.is_not_null() & off_h.is_not_null() & off_m.is_not_null() & (off_h <= 23) & (off_m <= 59)
+    valid_offset_clock = m2.struct.field("1").str.contains(
+        r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]$"
+    )
+    valid_off = (
+        base_dt.is_not_null()
+        & valid_offset_clock
+        & off_h.is_not_null()
+        & off_m.is_not_null()
+        & (off_h <= 23)
+        & (off_m <= 59)
+    )
     offset_ms = (off_h * 3_600_000 + off_m * 60_000) * pl.when(sign == "+").then(1).otherwise(-1)
     tz_ms = pl.when(valid_off).then(base_dt.dt.epoch("ms") - offset_ms).otherwise(None)
 
