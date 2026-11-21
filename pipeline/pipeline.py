@@ -2,7 +2,6 @@
 """
 Shopping Sessions: Hybrid Polars pipeline (exact small-file line parser + fast large-file Polars reader).
 """
-from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 import glob
@@ -477,15 +476,16 @@ def main():
         else:
             cl_df = pl.DataFrame(schema=cl_schema)
 
+    # Index clicks by person in timestamp and click-ID order.
+    # This supports efficient sliding-window campaign attribution.
     clicks_by_p: dict[str, list[tuple[int, str, str]]] = defaultdict(list)
-    for row in cl_df.iter_rows(named=True):
-        clicks_by_p[row["person"]].append((int(row["ts_ms"]), row["click_id"], row["campaign_id"]))
 
-    click_ts_by_p: dict[str, list[int]] = {}
-    for p_key, p_list in clicks_by_p.items():
-        p_list.sort(key=lambda x: x[0])
-        click_ts_by_p[p_key] = [x[0] for x in p_list]
-
+    for person, ts_ms, click_id, campaign_id in (
+        cl_df.sort(["person", "ts_ms", "click_id"]).iter_rows()
+    ):
+        clicks_by_p[person].append(
+            (int(ts_ms), click_id, campaign_id)
+        )
     if ev_df.height > 0:
         ev_sorted = ev_df.sort(["person", "ts_ms"])
         prev_ts = pl.col("ts_ms").shift(1).over("person")
@@ -588,50 +588,115 @@ def main():
         return entry
 
     if sessions_df.height > 0:
-        for s_row in sessions_df.iter_rows(named=True):
-            person = s_row["person"]
-            s_start = int(s_row["session_start_ts"])
-            s_day = s_row["session_day"]
-            s_purch = int(s_row["s_purchases"])
-            s_rev = int(s_row["s_revenue"])
+        # Process sessions chronologically for each person.
+        # Each click enters and leaves the seven-day window at most once.
+        ordered_sessions = sessions_df.sort(
+            ["person", "session_start_ts"]
+        )
 
-            p_clicks = clicks_by_p.get(person)
-            if p_clicks:
-                p_ts = click_ts_by_p[person]
-                lo = bisect_left(p_ts, s_start - LOOKBACK_7D_MS)
-                hi = bisect_right(p_ts, s_start)
-                if lo < hi:
-                    latest_ts = p_ts[hi - 1]
-                    best_click_id: str | None = None
-                    best_click_bytes: bytes | None = None
-                    credited_cid = ""
-                    assisting_cids: set[str] = set()
-                    for idx_c in range(lo, hi):
-                        c_ts, c_id, c_cid = p_clicks[idx_c]
-                        assisting_cids.add(c_cid)
-                        if c_ts == latest_ts:
-                            c_bytes = c_id.encode("utf-8")
-                            if best_click_bytes is None or c_bytes < best_click_bytes:
-                                best_click_bytes = c_bytes
-                                best_click_id = c_id
-                                credited_cid = c_cid
-                    assert best_click_id is not None
+        current_person = None
+        p_clicks = []
+        left = 0
+        right = 0
+
+        # Active click counts by campaign.
+        active_counts = {}
+
+        # Latest eligible click and its campaign.
+        latest_ts = None
+        latest_click_bytes = None
+        latest_cid = "organic"
+
+        session_columns = ordered_sessions.select([
+            "person",
+            "session_start_ts",
+            "session_day",
+            "s_purchases",
+            "s_revenue",
+        ])
+
+        for person, start_raw, s_day, purch_raw, rev_raw in (
+            session_columns.iter_rows()
+        ):
+            s_start = int(start_raw)
+            s_purch = int(purch_raw)
+            s_rev = int(rev_raw)
+
+            # Reset the window when the person changes.
+            if person != current_person:
+                current_person = person
+                p_clicks = clicks_by_p.get(person, [])
+                left = 0
+                right = 0
+                active_counts = {}
+                latest_ts = None
+                latest_click_bytes = None
+                latest_cid = "organic"
+
+            # Add clicks up to and including the session start.
+            while right < len(p_clicks):
+                c_ts, c_id, c_cid = p_clicks[right]
+
+                if c_ts > s_start:
+                    break
+
+                active_counts[c_cid] = (
+                    active_counts.get(c_cid, 0) + 1
+                )
+
+                c_id_bytes = c_id.encode("utf-8")
+
+                if (
+                    latest_ts is None
+                    or c_ts > latest_ts
+                    or (
+                        c_ts == latest_ts
+                        and c_id_bytes < latest_click_bytes
+                    )
+                ):
+                    latest_ts = c_ts
+                    latest_click_bytes = c_id_bytes
+                    latest_cid = c_cid
+
+                right += 1
+
+            # Remove clicks older than the seven-day lookback.
+            lower_bound = s_start - LOOKBACK_7D_MS
+
+            while (
+                left < right
+                and p_clicks[left][0] < lower_bound
+            ):
+                _, _, old_cid = p_clicks[left]
+
+                remaining = active_counts[old_cid] - 1
+
+                if remaining:
+                    active_counts[old_cid] = remaining
                 else:
-                    credited_cid = "organic"
-                    assisting_cids = set()
+                    del active_counts[old_cid]
+
+                left += 1
+
+            # Credit the latest eligible click, or organic.
+            if latest_ts is not None and latest_ts >= lower_bound:
+                credited_cid = latest_cid
+                assisting_cids = active_counts.keys()
             else:
                 credited_cid = "organic"
-                assisting_cids = set()
+                assisting_cids = ()
 
             c_entry = get_camp(credited_cid, s_day)
             c_entry["sessions"] += 1
+
             if s_purch > 0:
                 c_entry["purchasing_sessions"] += 1
+
             c_entry["revenue_cents"] += s_rev
 
+            # Each distinct campaign in the window receives one assist.
             for a_cid in assisting_cids:
                 get_camp(a_cid, s_day)["assisted_sessions"] += 1
-
     user_folder = os.path.join(OUT, "user_daily")
     camp_folder = os.path.join(OUT, "campaign_daily")
     os.makedirs(user_folder, exist_ok=True)
