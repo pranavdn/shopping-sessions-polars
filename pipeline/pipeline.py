@@ -27,6 +27,7 @@ MS_PER_DAY = 86_400_000
 SESSION_GAP_MS = 30 * MS_PER_MIN
 LATE_LIMIT_MS = 24 * MS_PER_HOUR
 LOOKBACK_7D_MS = 7 * MS_PER_DAY
+SMALL_FILE_THRESHOLD = 65_536
 EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 ASCII_DIGITS_RE = re.compile(r"^[0-9]+$")
@@ -95,6 +96,43 @@ def iter_csv_rows(path: str, expected_cols: int):
             parsed = parse_csv_line(line, expected_cols)
             if parsed is not None:
                 yield parsed
+
+def sanitize_csv_file(path: str, expected_cols: int, output_path: str) -> str | None:
+    """Drop malformed LF-delimited records before Polars reads a large shard.
+
+    The extra sentinel column ensures a CR at the end of a source record stays
+    inside its original field rather than being consumed as a CRLF terminator.
+    """
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(path, "rb") as source, open(output_path, "wb") as target:
+        header = source.readline()
+        if header == b"":
+            return None
+        if header.endswith(b"\\n"):
+            header = header[:-1]
+        if header.endswith(b"\\r"):
+            header = header[:-1]
+        target.write(header + b",__sentinel\\n")
+
+        for line in source:
+            if line.endswith(b"\\n"):
+                line = line[:-1]
+            fields = line.split(b",")
+            if len(fields) != expected_cols:
+                continue
+            valid = True
+            for field in fields:
+                if len(field) >= 2 and field.startswith(b'"') and field.endswith(b'"'):
+                    if b'"' in field[1:-1]:
+                        valid = False
+                        break
+                elif b'"' in field:
+                    valid = False
+                    break
+            if valid:
+                target.write(line + b",0\\n")
+    return output_path
+
 
 def parse_ts_ms(val: str) -> int | None:
     if not val:
@@ -236,11 +274,12 @@ def main():
     ev_schema = {"person": pl.String, "ts_ms": pl.Int64, "category": pl.String, "is_purchase": pl.Boolean, "rev_cents": pl.Int64}
     cl_schema = {"person": pl.String, "ts_ms": pl.Int64, "click_id": pl.String, "campaign_id": pl.String}
 
-    # Always use the exact line parser. The chunked Polars CSV path silently
-    # loses valid dev rows when malformed quoting desynchronizes a read chunk.
-    use_exact_line_parser = True
+    is_small_dataset = all(
+        os.path.getsize(p) < SMALL_FILE_THRESHOLD
+        for p in (event_files + click_files)
+    )
 
-    if use_exact_line_parser:
+    if is_small_dataset:
         kept_by_event_id: dict[str, tuple[int, list[str]]] = {}
         for ef in event_files:
             for row in iter_csv_rows(ef, 7):
@@ -308,17 +347,19 @@ def main():
     else:
         ev_frames = []
         expected_ev_cols = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"]
-        for ef in event_files:
-            try:
-                df = pl.read_csv(
-                    ef,
-                    has_header=True,
-                    infer_schema=False,
-                    ignore_errors=True,
-                    truncate_ragged_lines=False,
-                )
-            except Exception:
+        for idx, ef in enumerate(event_files):
+            clean_path = sanitize_csv_file(
+                ef, 7, os.path.join(SCRATCH, "sanitized", "events", f"part-{idx:05d}.csv")
+            )
+            if clean_path is None:
                 continue
+            df = pl.read_csv(
+                clean_path,
+                has_header=True,
+                infer_schema=False,
+                ignore_errors=False,
+                truncate_ragged_lines=False,
+            )
             if all(c in df.columns for c in expected_ev_cols):
                 ev_frames.append(df.select(expected_ev_cols))
 
@@ -327,7 +368,6 @@ def main():
             str_cols = [pl.col(c).cast(pl.String, strict=False).fill_null("") for c in expected_ev_cols]
             ev_df = (
                 ev_raw.with_columns(str_cols)
-                .filter(~pl.col("event_id").str.contains("[\r\n\"]"))
                 .with_columns([
                     ts_expr_to_ms("ingest_ts").alias("ingest_ms"),
                     ts_expr_to_ms("ts").alias("ts_ms"),
@@ -371,17 +411,19 @@ def main():
 
         cl_frames = []
         expected_cl_cols = ["click_id", "user_id", "campaign_id", "ts"]
-        for cf in click_files:
-            try:
-                df = pl.read_csv(
-                    cf,
-                    has_header=True,
-                    infer_schema=False,
-                    ignore_errors=True,
-                    truncate_ragged_lines=False,
-                )
-            except Exception:
+        for idx, cf in enumerate(click_files):
+            clean_path = sanitize_csv_file(
+                cf, 4, os.path.join(SCRATCH, "sanitized", "clicks", f"part-{idx:05d}.csv")
+            )
+            if clean_path is None:
                 continue
+            df = pl.read_csv(
+                clean_path,
+                has_header=True,
+                infer_schema=False,
+                ignore_errors=False,
+                truncate_ragged_lines=False,
+            )
             if all(c in df.columns for c in expected_cl_cols):
                 cl_frames.append(df.select(expected_cl_cols))
 
@@ -389,7 +431,6 @@ def main():
             cl_raw = pl.concat(cl_frames, how="vertical")
             cl_df = (
                 cl_raw.with_columns([pl.col(c).cast(pl.String, strict=False).fill_null("") for c in expected_cl_cols])
-                .filter(~pl.col("click_id").str.contains("[\r\n\"]"))
                 .with_columns(ts_expr_to_ms("ts").alias("ts_ms"))
                 .filter(pl.col("click_id") != "")
                 .unique(subset=["click_id"], keep="first", maintain_order=True)
