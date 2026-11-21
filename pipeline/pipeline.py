@@ -130,7 +130,7 @@ def sanitize_csv_file(path: str, expected_cols: int, output_path: str) -> str | 
                 if openings != closings or quote_count != openings + closings:
                     continue
 
-            target.write(line + b",0\\n")
+            target.write(line + b",0\n")
     return output_path
 
 
