@@ -84,7 +84,7 @@ def iter_csv_rows(path: str, expected_cols: int):
     """
     if not os.path.exists(path):
         return
-    with open(path, "r", encoding="utf-8", newline="") as f:
+    with open(path, "r", encoding="utf-8", newline="\n") as f:
         header = f.readline()
         if header == "":
             return
