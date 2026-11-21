@@ -607,43 +607,14 @@ def main():
                 credited_cid = "organic"
                 assisting_cids = set()
 
-            # Inline campaign lookup here: this path runs for every session and
-            # every assisting campaign, so avoiding a Python function call helps.
-            c_key = (credited_cid, s_day)
-            c_entry = camp_acc.get(c_key)
-            if c_entry is None:
-                c_channel = "organic" if credited_cid == "organic" else campaigns[credited_cid]
-                c_entry = {
-                    "campaign_id": credited_cid,
-                    "channel": c_channel,
-                    "day": s_day,
-                    "sessions": 0,
-                    "purchasing_sessions": 0,
-                    "revenue_cents": 0,
-                    "assisted_sessions": 0,
-                }
-                camp_acc[c_key] = c_entry
+            c_entry = get_camp(credited_cid, s_day)
             c_entry["sessions"] += 1
             if s_purch > 0:
                 c_entry["purchasing_sessions"] += 1
             c_entry["revenue_cents"] += s_rev
 
             for a_cid in assisting_cids:
-                a_key = (a_cid, s_day)
-                a_entry = camp_acc.get(a_key)
-                if a_entry is None:
-                    a_channel = "organic" if a_cid == "organic" else campaigns[a_cid]
-                    a_entry = {
-                        "campaign_id": a_cid,
-                        "channel": a_channel,
-                        "day": s_day,
-                        "sessions": 0,
-                        "purchasing_sessions": 0,
-                        "revenue_cents": 0,
-                        "assisted_sessions": 0,
-                    }
-                    camp_acc[a_key] = a_entry
-                a_entry["assisted_sessions"] += 1
+                get_camp(a_cid, s_day)["assisted_sessions"] += 1
 
     user_folder = os.path.join(OUT, "user_daily")
     camp_folder = os.path.join(OUT, "campaign_daily")
