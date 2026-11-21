@@ -108,14 +108,14 @@ def sanitize_csv_file(path: str, expected_cols: int, output_path: str) -> str | 
         header = source.readline()
         if header == b"":
             return None
-        if header.endswith(b"\\n"):
+        if header.endswith(b"\n"):
             header = header[:-1]
-        if header.endswith(b"\\r"):
+        if header.endswith(b"\r"):
             header = header[:-1]
-        target.write(header + b",__sentinel\\n")
+        target.write(header + b",__sentinel\n")
 
         for line in source:
-            if line.endswith(b"\\n"):
+            if line.endswith(b"\n"):
                 line = line[:-1]
             fields = line.split(b",")
             if len(fields) != expected_cols:
@@ -130,7 +130,7 @@ def sanitize_csv_file(path: str, expected_cols: int, output_path: str) -> str | 
                     valid = False
                     break
             if valid:
-                target.write(line + b",0\\n")
+                target.write(line + b",0\n")
     return output_path
 
 
