@@ -100,11 +100,14 @@ def iter_csv_rows(path: str, expected_cols: int):
 def sanitize_csv_file(path: str, expected_cols: int, output_path: str) -> str | None:
     """Drop malformed LF-delimited records before Polars reads a large shard.
 
-    The extra sentinel column ensures a CR at the end of a source record stays
-    inside its original field rather than being consumed as a CRLF terminator.
+    The extra sentinel column keeps a trailing CR inside its original field.
+    Output is buffered in batches to avoid one Python write call per record.
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(path, "rb") as source, open(output_path, "wb") as target:
+    write_batch = bytearray()
+    batch_limit = 4 * 1024 * 1024
+
+    with open(path, "rb") as source, open(output_path, "wb", buffering=1024 * 1024) as target:
         header = source.readline()
         if header == b"":
             return None
@@ -120,19 +123,25 @@ def sanitize_csv_file(path: str, expected_cols: int, output_path: str) -> str | 
             if line.count(b",") != expected_cols - 1:
                 continue
 
-            # A valid quoted field has exactly one opening quote (at the
-            # start of a field) and one closing quote (at its end). Comparing
-            # byte counts avoids allocating a split list for every CSV row.
-            quote_count = line.count(b'"')
-            if quote_count:
+            # The common generated-data path has no quote characters. Only
+            # run the stricter quote-boundary checks when a quote is present.
+            if b'"' in line:
+                quote_count = line.count(b'"')
                 openings = line.count(b',"') + line.startswith(b'"')
                 closings = line.count(b'",') + line.endswith(b'"')
                 if openings != closings or quote_count != openings + closings:
                     continue
 
-            target.write(line + b",0\n")
-    return output_path
+            write_batch.extend(line)
+            write_batch.extend(b",0\n")
+            if len(write_batch) >= batch_limit:
+                target.write(write_batch)
+                write_batch.clear()
 
+        if write_batch:
+            target.write(write_batch)
+
+    return output_path
 
 def parse_ts_ms(val: str) -> int | None:
     if not val:
